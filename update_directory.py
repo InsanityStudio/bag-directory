@@ -22,12 +22,13 @@ CATEGORY_POSTS = {
 USERNAME = os.environ["SCRATCH_USERNAME"]
 PASSWORD = os.environ["SCRATCH_PASSWORD"]
 DRY_RUN  = os.environ.get("DRY_RUN", "false").lower() == "true"
-DEBUG    = os.environ.get("DEBUG", "true").lower() == "true"
+DEBUG    = os.environ.get("DEBUG", "false").lower() == "true"
+REPAIR_MOJIBAKE = os.environ.get("REPAIR_MOJIBAKE", "false").lower() == "true"
 
 NS = {"atom": "http://www.w3.org/2005/Atom"}
 
 
-# ── Feed fetching + parsing (unchanged from previous version) ──────────────
+# ── Feed fetching + parsing ────────────────────────────────────────────────
 
 def fetch_feed(cookies=None):
     r = requests.get(
@@ -37,6 +38,7 @@ def fetch_feed(cookies=None):
         timeout=30,
     )
     r.raise_for_status()
+    r.encoding = "utf-8"          # ← CRITICAL: force UTF-8
     return r.text
 
 
@@ -67,9 +69,7 @@ def parse_posts(xml_text, verbose=False):
         post_id = int(m.group(1))
 
         content_el = entry.find("atom:content", NS)
-        raw = ""
-        if content_el is not None:
-            raw = (content_el.text or "")
+        raw = (content_el.text or "") if content_el is not None else ""
         if not raw:
             raw = entry.findtext("atom:summary", default="", namespaces=NS) or ""
 
@@ -111,17 +111,7 @@ def extract_request(body, verbose=False):
     }
 
 
-def diagnose(posts):
-    print("\n" + "=" * 78)
-    print("DIAGNOSTIC DUMP")
-    print("=" * 78)
-    for i, p in enumerate(posts, 1):
-        print(f"\n─── [{i}/{len(posts)}] post {p['post_id']} ───")
-        print(f"PLAINTEXT[:400]: {p['body'][:400]!r}")
-    print("\n" + "=" * 78 + "\n")
-
-
-# ── Source fetching + edit ─────────────────────────────────────────────────
+# ── Source fetching + mojibake repair ─────────────────────────────────────
 
 def fetch_source(post_id, cookies):
     r = requests.get(
@@ -130,11 +120,34 @@ def fetch_source(post_id, cookies):
         timeout=30,
     )
     r.raise_for_status()
+    r.encoding = "utf-8"          # ← CRITICAL: force UTF-8
     text = r.text
+
+    # Unwrap if Scratch returns <pre>...</pre>
     m = re.match(r"^\s*<pre[^>]*>(.*)</pre>\s*$", text, re.DOTALL | re.IGNORECASE)
     if m:
         text = html_lib.unescape(m.group(1))
     return text
+
+
+def repair_mojibake(s, max_rounds=4):
+    """
+    Attempt to reverse latin-1-decoded-as-utf-8 mojibake.
+    Each round shrinks the string if it's really mojibake.
+    Stops as soon as a round fails to shrink.
+    """
+    current = s
+    for _ in range(max_rounds):
+        try:
+            candidate = current.encode("latin-1").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            break
+        if candidate == current:
+            break
+        if len(candidate) >= len(current):
+            break
+        current = candidate
+    return current
 
 
 def existing_urls(source_bbcode):
@@ -149,28 +162,23 @@ def build_entry(req):
     )
 
 
-def normalize_for_compare(s):
-    """Collapse line endings and strip trailing whitespace."""
-    return s.replace("\r\n", "\n").replace("\r", "\n").rstrip()
+# ── Semantic verification + edit ──────────────────────────────────────────
 
-
-def find_first_divergence(a, b):
-    """First index where a and b differ (after normalization)."""
-    for i, (ca, cb) in enumerate(zip(a, b)):
-        if ca != cb:
-            return i
-    if len(a) != len(b):
-        return min(len(a), len(b))
-    return -1
-
-
-def edit_post_verified(post_id, new_body, expected_prefix, appended_blocks,
+def edit_post_verified(post_id, new_body, original_source, appended_blocks,
                        cookies, csrf):
+    """
+    - Aborts if the live source changed since we read it.
+    - After editing, verifies:
+        (a) every appended block is present
+        (b) every [url=…] that existed before still exists
+    Semantic checks — no byte-exact startswith, so mojibake can't cause
+    false failures.
+    """
     edit_url = f"https://scratch.mit.edu/discuss/post/{post_id}/edit/"
 
-    # 1. Confirm nothing changed under us (normalized)
-    live = fetch_source(post_id, cookies)
-    if normalize_for_compare(live) != normalize_for_compare(expected_prefix):
+    # 1. Confirm nothing changed since read
+    live = fetch_source(post_id, cookies).rstrip()
+    if live != original_source:
         raise RuntimeError(
             f"Post {post_id} changed between read and write. Aborting."
         )
@@ -203,47 +211,27 @@ def edit_post_verified(post_id, new_body, expected_prefix, appended_blocks,
     time.sleep(2)
     after = fetch_source(post_id, cookies)
 
-    # (a) PRIMARY: every appended block must be present
-    missing = [b for b in appended_blocks if b not in after]
-    if missing:
+    # (a) appended blocks present
+    missing_blocks = [b for b in appended_blocks if b not in after]
+    if missing_blocks:
         raise RuntimeError(
-            f"ABORT: {len(missing)} of {len(appended_blocks)} appended blocks missing from "
-            f"post {post_id}. First missing (first 300 chars):\n{missing[0][:300]}"
+            f"ABORT: {len(missing_blocks)} of {len(appended_blocks)} appended blocks "
+            f"missing from post {post_id}.\nFirst missing[:300]: {missing_blocks[0][:300]}"
         )
 
-    # (b) SECONDARY: original content preserved (normalized comparison)
-    nb = normalize_for_compare(expected_prefix)
-    na = normalize_for_compare(after)
-
-    if na.startswith(nb):
-        print(f"  ✅ verified: post {post_id} preserved + {len(appended_blocks)} appended")
-        return
-
-    idx = find_first_divergence(nb, na)
-    if idx < 0:
-        # Only length differs — safe, blocks are present
-        print(f"  ✅ verified (length-only): post {post_id} + {len(appended_blocks)} appended")
-        return
-
-    ctx_before = nb[max(0, idx - 30):idx + 30]
-    ctx_after  = na[max(0, idx - 30):idx + 30]
-
-    # Only fail if divergence is severe (i.e., the original was really clobbered).
-    if idx < len(nb) * 0.9:
+    # (b) every URL from the original still present
+    before_urls = existing_urls(original_source)
+    after_urls = existing_urls(after)
+    lost = before_urls - after_urls
+    if lost:
         raise RuntimeError(
-            f"ABORT: original content of post {post_id} altered near position {idx}.\n"
-            f"  before: {ctx_before!r}\n"
-            f"  after:  {ctx_after!r}"
+            f"ABORT: {len(lost)} URL(s) lost from post {post_id}:\n{sorted(lost)[:5]}"
         )
 
-    # Minor divergence in the final 10% — treat as cosmetic, warn only.
     print(
-        f"  ⚠ post {post_id}: minor whitespace-level divergence at pos {idx} "
-        f"(likely line-ending normalization by Scratch). Content preserved, "
-        f"{len(appended_blocks)} block(s) appended. Treating as success."
+        f"  ✅ verified: post {post_id} "
+        f"(URLs preserved: {len(before_urls)}, blocks appended: {len(appended_blocks)})"
     )
-    print(f"    before: {ctx_before!r}")
-    print(f"    after:  {ctx_after!r}")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -251,6 +239,8 @@ def edit_post_verified(post_id, new_body, expected_prefix, appended_blocks,
 def main():
     if DRY_RUN:
         print("*** DRY RUN — no edits will be sent ***")
+    if REPAIR_MOJIBAKE:
+        print("*** MOJIBAKE REPAIR ENABLED ***")
 
     print("Logging in to Scratch…")
     session = scratch3.login(USERNAME, PASSWORD)
@@ -263,9 +253,6 @@ def main():
     xml = fetch_feed(cookies)
     posts = list(parse_posts(xml, verbose=DEBUG))
     print(f"[parse] parsed {len(posts)} posts")
-
-    if DEBUG and posts:
-        diagnose(posts)
 
     requests_found = []
     for p in posts:
@@ -283,7 +270,7 @@ def main():
     for cat, post_id in CATEGORY_POSTS.items():
         if post_id in sources:
             continue
-        sources[post_id] = fetch_source(post_id, cookies)
+        sources[post_id] = fetch_source(post_id, cookies).rstrip()
         print(f"  • post {post_id} ({cat}) → {len(sources[post_id])} chars")
 
     per_category_new = {}
@@ -303,8 +290,17 @@ def main():
 
     failed = False
     for target_id, blocks in per_category_new.items():
-        old_body = sources[target_id].rstrip()
-        new_body = old_body + "\n" + "\n".join(blocks) + "\n"
+        original_source = sources[target_id]     # what we compare against later
+
+        base_body = original_source
+        if REPAIR_MOJIBAKE:
+            repaired = repair_mojibake(original_source)
+            if repaired != original_source:
+                delta = len(original_source) - len(repaired)
+                print(f"  ⚠ repairing mojibake in post {target_id} (−{delta} chars)")
+                base_body = repaired
+
+        new_body = base_body + "\n" + "\n".join(blocks) + "\n"
 
         print(f"Editing post {target_id} (+{len(blocks)} entries)…")
         if DRY_RUN:
@@ -313,7 +309,9 @@ def main():
             continue
 
         try:
-            edit_post_verified(target_id, new_body, old_body, blocks, cookies, csrf)
+            edit_post_verified(
+                target_id, new_body, original_source, blocks, cookies, csrf
+            )
         except RuntimeError as e:
             print(f"  ❌ {e}")
             failed = True
