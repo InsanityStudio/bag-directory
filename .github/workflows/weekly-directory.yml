@@ -2,8 +2,8 @@ name: Weekly Scratch Directory Update
 
 on:
   schedule:
-    # Every Monday at 09:00 UTC — adjust as you like
-    - cron: '0 9 * * 1'
+    # Every Monday at 04:00 UTC — adjust as you like
+    - cron: '0 4 * * 1'
 
   workflow_dispatch:        # manual "Run workflow" button
 
