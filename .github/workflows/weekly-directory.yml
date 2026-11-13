@@ -1,0 +1,30 @@
+name: Weekly Scratch Directory Update
+
+on:
+  schedule:
+    # Every Monday at 09:00 UTC — adjust as you like
+    - cron: '0 9 * * 1'
+
+  workflow_dispatch:        # manual "Run workflow" button
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests scratchattach
+
+      - name: Run directory updater
+        env:
+          SCRATCH_USERNAME: ${{ secrets.SCRATCH_USERNAME }}
+          SCRATCH_PASSWORD: ${{ secrets.SCRATCH_PASSWORD }}
+        run: python update_directory.py
